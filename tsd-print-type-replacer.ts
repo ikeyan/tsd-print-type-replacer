@@ -12,6 +12,7 @@
 import ts from "npm:typescript@5.6.3";
 import parseArgs from "npm:minimist@1.2.8";
 import * as path from "node:path";
+import { styleText } from "node:util";
 
 const HELP = `tsd-print-type-replacer - rewrite \`{} as T\` assertions from tsd printType output
 
@@ -28,7 +29,8 @@ OPTIONS
   -n, --next-statement-only   Only rewrite the statement immediately after each
                               printType call. By default, every matching
                               expression in the file is rewritten.
-      --dry-run               Show planned edits without writing files.
+      --dry-run               Show a unified diff of planned edits without
+                              writing files. Colors the output on a TTY.
   -h, --help                  Show this help.
 
 INPUT
@@ -308,6 +310,268 @@ function processFile(
 }
 
 // ---------------------------------------------------------------------------
+// Myers line diff (with prefix/suffix trimming + D-cap heuristic)
+// ---------------------------------------------------------------------------
+
+// Tuple shape matches node:util.diff: op is 0 (unchanged), 1 (only in `a`),
+// or -1 (only in `b`).
+type DiffOp = [0 | 1 | -1, string];
+
+// If the edit distance exceeds this, we give up the optimal diff and just
+// emit "remove everything / add everything" for the differing middle. Keeps
+// memory bounded at ~O(D·(N+M)) without compromising typical source-file
+// workloads, where D is tiny.
+const MYERS_D_CAP = 4000;
+
+function myersLineDiff(a: readonly string[], b: readonly string[]): DiffOp[] {
+  // Heuristic 1: strip common prefix and suffix. Huge speedup for typical
+  // "rewrite a few lines in a mostly identical file" diffs.
+  const N0 = a.length;
+  const M0 = b.length;
+  let prefix = 0;
+  while (prefix < N0 && prefix < M0 && a[prefix] === b[prefix]) prefix++;
+  let suffix = 0;
+  while (
+    suffix < N0 - prefix &&
+    suffix < M0 - prefix &&
+    a[N0 - 1 - suffix] === b[M0 - 1 - suffix]
+  ) suffix++;
+
+  const out: DiffOp[] = [];
+  for (let i = 0; i < prefix; i++) out.push([0, a[i]]);
+
+  const aMid = a.slice(prefix, N0 - suffix);
+  const bMid = b.slice(prefix, M0 - suffix);
+  if (aMid.length === 0) {
+    for (const s of bMid) out.push([-1, s]);
+  } else if (bMid.length === 0) {
+    for (const s of aMid) out.push([1, s]);
+  } else {
+    for (const op of myersCore(aMid, bMid)) out.push(op);
+  }
+
+  for (let i = 0; i < suffix; i++) out.push([0, a[N0 - suffix + i]]);
+  return out;
+}
+
+function myersCore(a: readonly string[], b: readonly string[]): DiffOp[] {
+  // Classic O((N+M)D) Myers: walk increasing edit distances d, track the
+  // furthest-reaching x on each diagonal k = x - y in V[], snapshotting V
+  // on each iteration so we can backtrack the edit script at the end.
+  const N = a.length;
+  const M = b.length;
+  const MAX = N + M;
+  const offset = MAX;
+  const V = new Int32Array(2 * MAX + 1);
+  const trace: Int32Array[] = [];
+  const dCap = Math.min(MAX, MYERS_D_CAP);
+
+  let foundD = -1;
+  outer: for (let d = 0; d <= dCap; d++) {
+    trace.push(new Int32Array(V));
+    for (let k = -d; k <= d; k += 2) {
+      let x: number;
+      if (k === -d || (k !== d && V[offset + k - 1] < V[offset + k + 1])) {
+        x = V[offset + k + 1]; // insertion from b (down)
+      } else {
+        x = V[offset + k - 1] + 1; // deletion from a (right)
+      }
+      let y = x - k;
+      while (x < N && y < M && a[x] === b[y]) {
+        x++;
+        y++;
+      }
+      V[offset + k] = x;
+      if (x >= N && y >= M) {
+        foundD = d;
+        break outer;
+      }
+    }
+  }
+
+  // Heuristic 2: cap on D. If the edit distance is pathologically large we
+  // fall back to the trivial "remove a, add b" diff rather than blow memory.
+  if (foundD < 0) {
+    const fallback: DiffOp[] = [];
+    for (const s of a) fallback.push([1, s]);
+    for (const s of b) fallback.push([-1, s]);
+    return fallback;
+  }
+
+  const ops: DiffOp[] = [];
+  let x = N;
+  let y = M;
+  for (let d = foundD; d > 0; d--) {
+    const Vd = trace[d];
+    const k = x - y;
+    let prevK: number;
+    if (k === -d || (k !== d && Vd[offset + k - 1] < Vd[offset + k + 1])) {
+      prevK = k + 1;
+    } else {
+      prevK = k - 1;
+    }
+    const prevX = Vd[offset + prevK];
+    const prevY = prevX - prevK;
+    while (x > prevX && y > prevY) {
+      ops.push([0, a[x - 1]]);
+      x--;
+      y--;
+    }
+    if (x === prevX) {
+      ops.push([-1, b[y - 1]]);
+      y--;
+    } else {
+      ops.push([1, a[x - 1]]);
+      x--;
+    }
+  }
+  // d=0: drain the remaining diagonal back to the origin.
+  while (x > 0 && y > 0) {
+    ops.push([0, a[x - 1]]);
+    x--;
+    y--;
+  }
+  ops.reverse();
+  return ops;
+}
+
+// ---------------------------------------------------------------------------
+// Unified diff rendering (for --dry-run)
+// ---------------------------------------------------------------------------
+
+type DiffLineKind = " " | "-" | "+";
+
+interface DiffHunk {
+  oldStart: number;
+  oldCount: number;
+  newStart: number;
+  newCount: number;
+  lines: Array<{ kind: DiffLineKind; text: string }>;
+}
+
+function buildHunks(
+  oldContent: string,
+  newContent: string,
+  context: number,
+): DiffHunk[] {
+  const oldLines = oldContent.split("\n");
+  const newLines = newContent.split("\n");
+
+  // myersLineDiff(a, b) returns [op, value] tuples where
+  //   op ===  0 → unchanged
+  //   op ===  1 → only in `a` (old) → render as "-"
+  //   op === -1 → only in `b` (new) → render as "+"
+  const ops = myersLineDiff(oldLines, newLines);
+
+  const lines: Array<{ kind: DiffLineKind; text: string }> = ops.map(
+    ([op, text]) => ({
+      kind: op === 0 ? " " : op === 1 ? "-" : "+",
+      text,
+    }),
+  );
+
+  const positions: Array<{ oldPos: number; newPos: number }> = [];
+  {
+    let oldPos = 1;
+    let newPos = 1;
+    for (const ln of lines) {
+      positions.push({ oldPos, newPos });
+      if (ln.kind !== "+") oldPos++;
+      if (ln.kind !== "-") newPos++;
+    }
+  }
+
+  const hunks: DiffHunk[] = [];
+  let i = 0;
+  while (i < lines.length) {
+    if (lines[i].kind === " ") {
+      i++;
+      continue;
+    }
+
+    let start = i;
+    let back = 0;
+    while (start > 0 && lines[start - 1].kind === " " && back < context) {
+      start--;
+      back++;
+    }
+
+    let end = i;
+    while (end < lines.length) {
+      while (end < lines.length && lines[end].kind !== " ") end++;
+      let gap = 0;
+      while (
+        end + gap < lines.length &&
+        lines[end + gap].kind === " " &&
+        gap < context * 2
+      ) gap++;
+      if (end + gap < lines.length && lines[end + gap].kind !== " ") {
+        end += gap;
+        continue;
+      }
+      end += Math.min(context, gap);
+      break;
+    }
+
+    const body = lines.slice(start, end);
+    let oldCount = 0;
+    let newCount = 0;
+    for (const ln of body) {
+      if (ln.kind !== "+") oldCount++;
+      if (ln.kind !== "-") newCount++;
+    }
+    const anchor = positions[start] ?? { oldPos: 1, newPos: 1 };
+    hunks.push({
+      oldStart: oldCount === 0 ? anchor.oldPos - 1 : anchor.oldPos,
+      oldCount,
+      newStart: newCount === 0 ? anchor.newPos - 1 : anchor.newPos,
+      newCount,
+      lines: body,
+    });
+
+    i = end;
+  }
+
+  return hunks;
+}
+
+type StyleTextFormat = Parameters<typeof styleText>[0];
+
+function renderUnifiedDiff(
+  oldContent: string,
+  newContent: string,
+  displayPath: string,
+  useColor: boolean,
+): string {
+  // Deno 2.7's styleText doesn't actually gate on the target stream, so we
+  // keep our own `useColor` decision (set in main() from Deno.stdout.isTerminal)
+  // and force styleText to apply the escape codes with validateStream:false.
+  const paint = (format: StyleTextFormat, text: string) =>
+    useColor ? styleText(format, text, { validateStream: false }) : text;
+
+  const hunks = buildHunks(oldContent, newContent, 3);
+  if (hunks.length === 0) return "";
+
+  const out: string[] = [];
+  out.push(paint("bold", `--- a/${displayPath}`));
+  out.push(paint("bold", `+++ b/${displayPath}`));
+  for (const h of hunks) {
+    out.push(
+      paint(
+        "cyan",
+        `@@ -${h.oldStart},${h.oldCount} +${h.newStart},${h.newCount} @@`,
+      ),
+    );
+    for (const ln of h.lines) {
+      if (ln.kind === "-") out.push(paint("red", `-${ln.text}`));
+      else if (ln.kind === "+") out.push(paint("green", `+${ln.text}`));
+      else out.push(` ${ln.text}`);
+    }
+  }
+  return out.join("\n");
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -340,6 +604,8 @@ async function main() {
   const baseDir = positional.length > 0 ? String(positional[0]) : ".";
   const nextOnly = Boolean(args["next-statement-only"]);
   const dryRun = Boolean(args["dry-run"]);
+
+  const useColor = dryRun && Deno.stdout.isTerminal();
 
   const raw = await readStdin();
   const diagnostics = parseTsdOutput(raw);
@@ -387,8 +653,9 @@ async function main() {
     if (output === source) continue;
 
     if (dryRun) {
-      console.log(`[dry-run] ${filePath}: ${edits.length} edit(s)`);
-      for (const e of edits) console.log(`  ${e.note}`);
+      const displayPath = path.relative(Deno.cwd(), filePath) || filePath;
+      const rendered = renderUnifiedDiff(source, output, displayPath, useColor);
+      if (rendered) console.log(rendered);
     } else {
       await Deno.writeTextFile(filePath, output);
       console.log(`updated ${filePath} (${edits.length} edit(s))`);
