@@ -12,15 +12,6 @@
 import ts from "npm:typescript@5.6.3";
 import parseArgs from "npm:minimist@1.2.8";
 import * as path from "node:path";
-import util from "node:util";
-
-// `util.diff` landed in Node.js 22.x and will surface in Deno once its Node
-// compatibility layer catches up. Resolve it at runtime so importing this
-// module still works on older runtimes (the check fires only for `--dry-run`).
-type DiffOp = readonly [number, string];
-const utilDiff = (util as unknown as {
-  diff?: (actual: readonly string[], expected: readonly string[]) => DiffOp[];
-}).diff;
 
 const HELP = `tsd-print-type-replacer - rewrite \`{} as T\` assertions from tsd printType output
 
@@ -318,6 +309,132 @@ function processFile(
 }
 
 // ---------------------------------------------------------------------------
+// Myers line diff (with prefix/suffix trimming + D-cap heuristic)
+// ---------------------------------------------------------------------------
+
+// Tuple shape matches node:util.diff: op is 0 (unchanged), 1 (only in `a`),
+// or -1 (only in `b`).
+type DiffOp = [0 | 1 | -1, string];
+
+// If the edit distance exceeds this, we give up the optimal diff and just
+// emit "remove everything / add everything" for the differing middle. Keeps
+// memory bounded at ~O(D·(N+M)) without compromising typical source-file
+// workloads, where D is tiny.
+const MYERS_D_CAP = 4000;
+
+function myersLineDiff(a: readonly string[], b: readonly string[]): DiffOp[] {
+  // Heuristic 1: strip common prefix and suffix. Huge speedup for typical
+  // "rewrite a few lines in a mostly identical file" diffs.
+  const N0 = a.length;
+  const M0 = b.length;
+  let prefix = 0;
+  while (prefix < N0 && prefix < M0 && a[prefix] === b[prefix]) prefix++;
+  let suffix = 0;
+  while (
+    suffix < N0 - prefix &&
+    suffix < M0 - prefix &&
+    a[N0 - 1 - suffix] === b[M0 - 1 - suffix]
+  ) suffix++;
+
+  const out: DiffOp[] = [];
+  for (let i = 0; i < prefix; i++) out.push([0, a[i]]);
+
+  const aMid = a.slice(prefix, N0 - suffix);
+  const bMid = b.slice(prefix, M0 - suffix);
+  if (aMid.length === 0) {
+    for (const s of bMid) out.push([-1, s]);
+  } else if (bMid.length === 0) {
+    for (const s of aMid) out.push([1, s]);
+  } else {
+    for (const op of myersCore(aMid, bMid)) out.push(op);
+  }
+
+  for (let i = 0; i < suffix; i++) out.push([0, a[N0 - suffix + i]]);
+  return out;
+}
+
+function myersCore(a: readonly string[], b: readonly string[]): DiffOp[] {
+  // Classic O((N+M)D) Myers: walk increasing edit distances d, track the
+  // furthest-reaching x on each diagonal k = x - y in V[], snapshotting V
+  // on each iteration so we can backtrack the edit script at the end.
+  const N = a.length;
+  const M = b.length;
+  const MAX = N + M;
+  const offset = MAX;
+  const V = new Int32Array(2 * MAX + 1);
+  const trace: Int32Array[] = [];
+  const dCap = Math.min(MAX, MYERS_D_CAP);
+
+  let foundD = -1;
+  outer: for (let d = 0; d <= dCap; d++) {
+    trace.push(new Int32Array(V));
+    for (let k = -d; k <= d; k += 2) {
+      let x: number;
+      if (k === -d || (k !== d && V[offset + k - 1] < V[offset + k + 1])) {
+        x = V[offset + k + 1]; // insertion from b (down)
+      } else {
+        x = V[offset + k - 1] + 1; // deletion from a (right)
+      }
+      let y = x - k;
+      while (x < N && y < M && a[x] === b[y]) {
+        x++;
+        y++;
+      }
+      V[offset + k] = x;
+      if (x >= N && y >= M) {
+        foundD = d;
+        break outer;
+      }
+    }
+  }
+
+  // Heuristic 2: cap on D. If the edit distance is pathologically large we
+  // fall back to the trivial "remove a, add b" diff rather than blow memory.
+  if (foundD < 0) {
+    const fallback: DiffOp[] = [];
+    for (const s of a) fallback.push([1, s]);
+    for (const s of b) fallback.push([-1, s]);
+    return fallback;
+  }
+
+  const ops: DiffOp[] = [];
+  let x = N;
+  let y = M;
+  for (let d = foundD; d > 0; d--) {
+    const Vd = trace[d];
+    const k = x - y;
+    let prevK: number;
+    if (k === -d || (k !== d && Vd[offset + k - 1] < Vd[offset + k + 1])) {
+      prevK = k + 1;
+    } else {
+      prevK = k - 1;
+    }
+    const prevX = Vd[offset + prevK];
+    const prevY = prevX - prevK;
+    while (x > prevX && y > prevY) {
+      ops.push([0, a[x - 1]]);
+      x--;
+      y--;
+    }
+    if (x === prevX) {
+      ops.push([-1, b[y - 1]]);
+      y--;
+    } else {
+      ops.push([1, a[x - 1]]);
+      x--;
+    }
+  }
+  // d=0: drain the remaining diagonal back to the origin.
+  while (x > 0 && y > 0) {
+    ops.push([0, a[x - 1]]);
+    x--;
+    y--;
+  }
+  ops.reverse();
+  return ops;
+}
+
+// ---------------------------------------------------------------------------
 // Unified diff rendering (for --dry-run)
 // ---------------------------------------------------------------------------
 
@@ -347,12 +464,11 @@ function buildHunks(
   const oldLines = oldContent.split("\n");
   const newLines = newContent.split("\n");
 
-  // node:util.diff(actual, expected) returns [op, value] tuples where
+  // myersLineDiff(a, b) returns [op, value] tuples where
   //   op ===  0 → unchanged
-  //   op ===  1 → only in `actual` (old) → render as "-"
-  //   op === -1 → only in `expected` (new) → render as "+"
-  // Caller must guarantee `utilDiff` is a function (checked in main()).
-  const ops = utilDiff!(oldLines, newLines);
+  //   op ===  1 → only in `a` (old) → render as "-"
+  //   op === -1 → only in `b` (new) → render as "+"
+  const ops = myersLineDiff(oldLines, newLines);
 
   const lines: Array<{ kind: DiffLineKind; text: string }> = ops.map(
     ([op, text]) => ({
@@ -489,15 +605,6 @@ async function main() {
   const baseDir = positional.length > 0 ? String(positional[0]) : ".";
   const nextOnly = Boolean(args["next-statement-only"]);
   const dryRun = Boolean(args["dry-run"]);
-
-  if (dryRun && !utilDiff) {
-    console.error(
-      "tsd-print-type-replacer: --dry-run needs node:util.diff, which this runtime " +
-        "does not expose yet (requires Node.js 22+ or a Deno release whose node compat " +
-        "layer includes util.diff).",
-    );
-    Deno.exit(2);
-  }
 
   const useColor = dryRun && Deno.stdout.isTerminal();
 
