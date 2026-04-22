@@ -12,6 +12,15 @@
 import ts from "npm:typescript@5.6.3";
 import parseArgs from "npm:minimist@1.2.8";
 import * as path from "node:path";
+import util from "node:util";
+
+// `util.diff` landed in Node.js 22.x and will surface in Deno once its Node
+// compatibility layer catches up. Resolve it at runtime so importing this
+// module still works on older runtimes (the check fires only for `--dry-run`).
+type DiffOp = readonly [number, string];
+const utilDiff = (util as unknown as {
+  diff?: (actual: readonly string[], expected: readonly string[]) => DiffOp[];
+}).diff;
 
 const HELP = `tsd-print-type-replacer - rewrite \`{} as T\` assertions from tsd printType output
 
@@ -28,7 +37,8 @@ OPTIONS
   -n, --next-statement-only   Only rewrite the statement immediately after each
                               printType call. By default, every matching
                               expression in the file is rewritten.
-      --dry-run               Show planned edits without writing files.
+      --dry-run               Show a unified diff of planned edits without
+                              writing files. Colors the output on a TTY.
   -h, --help                  Show this help.
 
 INPUT
@@ -308,6 +318,145 @@ function processFile(
 }
 
 // ---------------------------------------------------------------------------
+// Unified diff rendering (for --dry-run)
+// ---------------------------------------------------------------------------
+
+const ANSI = {
+  reset: "\x1b[0m",
+  red: "\x1b[31m",
+  green: "\x1b[32m",
+  cyan: "\x1b[36m",
+  bold: "\x1b[1m",
+};
+
+type DiffLineKind = " " | "-" | "+";
+
+interface DiffHunk {
+  oldStart: number;
+  oldCount: number;
+  newStart: number;
+  newCount: number;
+  lines: Array<{ kind: DiffLineKind; text: string }>;
+}
+
+function buildHunks(
+  oldContent: string,
+  newContent: string,
+  context: number,
+): DiffHunk[] {
+  const oldLines = oldContent.split("\n");
+  const newLines = newContent.split("\n");
+
+  // node:util.diff(actual, expected) returns [op, value] tuples where
+  //   op ===  0 → unchanged
+  //   op ===  1 → only in `actual` (old) → render as "-"
+  //   op === -1 → only in `expected` (new) → render as "+"
+  // Caller must guarantee `utilDiff` is a function (checked in main()).
+  const ops = utilDiff!(oldLines, newLines);
+
+  const lines: Array<{ kind: DiffLineKind; text: string }> = ops.map(
+    ([op, text]) => ({
+      kind: op === 0 ? " " : op === 1 ? "-" : "+",
+      text,
+    }),
+  );
+
+  const positions: Array<{ oldPos: number; newPos: number }> = [];
+  {
+    let oldPos = 1;
+    let newPos = 1;
+    for (const ln of lines) {
+      positions.push({ oldPos, newPos });
+      if (ln.kind !== "+") oldPos++;
+      if (ln.kind !== "-") newPos++;
+    }
+  }
+
+  const hunks: DiffHunk[] = [];
+  let i = 0;
+  while (i < lines.length) {
+    if (lines[i].kind === " ") {
+      i++;
+      continue;
+    }
+
+    let start = i;
+    let back = 0;
+    while (start > 0 && lines[start - 1].kind === " " && back < context) {
+      start--;
+      back++;
+    }
+
+    let end = i;
+    while (end < lines.length) {
+      while (end < lines.length && lines[end].kind !== " ") end++;
+      let gap = 0;
+      while (
+        end + gap < lines.length &&
+        lines[end + gap].kind === " " &&
+        gap < context * 2
+      ) gap++;
+      if (end + gap < lines.length && lines[end + gap].kind !== " ") {
+        end += gap;
+        continue;
+      }
+      end += Math.min(context, gap);
+      break;
+    }
+
+    const body = lines.slice(start, end);
+    let oldCount = 0;
+    let newCount = 0;
+    for (const ln of body) {
+      if (ln.kind !== "+") oldCount++;
+      if (ln.kind !== "-") newCount++;
+    }
+    const anchor = positions[start] ?? { oldPos: 1, newPos: 1 };
+    hunks.push({
+      oldStart: oldCount === 0 ? anchor.oldPos - 1 : anchor.oldPos,
+      oldCount,
+      newStart: newCount === 0 ? anchor.newPos - 1 : anchor.newPos,
+      newCount,
+      lines: body,
+    });
+
+    i = end;
+  }
+
+  return hunks;
+}
+
+function renderUnifiedDiff(
+  oldContent: string,
+  newContent: string,
+  displayPath: string,
+  useColor: boolean,
+): string {
+  const paint = (codes: string, s: string) => useColor ? `${codes}${s}${ANSI.reset}` : s;
+
+  const hunks = buildHunks(oldContent, newContent, 3);
+  if (hunks.length === 0) return "";
+
+  const out: string[] = [];
+  out.push(paint(ANSI.bold, `--- a/${displayPath}`));
+  out.push(paint(ANSI.bold, `+++ b/${displayPath}`));
+  for (const h of hunks) {
+    out.push(
+      paint(
+        ANSI.cyan,
+        `@@ -${h.oldStart},${h.oldCount} +${h.newStart},${h.newCount} @@`,
+      ),
+    );
+    for (const ln of h.lines) {
+      if (ln.kind === "-") out.push(paint(ANSI.red, `-${ln.text}`));
+      else if (ln.kind === "+") out.push(paint(ANSI.green, `+${ln.text}`));
+      else out.push(` ${ln.text}`);
+    }
+  }
+  return out.join("\n");
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -340,6 +489,17 @@ async function main() {
   const baseDir = positional.length > 0 ? String(positional[0]) : ".";
   const nextOnly = Boolean(args["next-statement-only"]);
   const dryRun = Boolean(args["dry-run"]);
+
+  if (dryRun && !utilDiff) {
+    console.error(
+      "tsd-print-type-replacer: --dry-run needs node:util.diff, which this runtime " +
+        "does not expose yet (requires Node.js 22+ or a Deno release whose node compat " +
+        "layer includes util.diff).",
+    );
+    Deno.exit(2);
+  }
+
+  const useColor = dryRun && Deno.stdout.isTerminal();
 
   const raw = await readStdin();
   const diagnostics = parseTsdOutput(raw);
@@ -387,8 +547,9 @@ async function main() {
     if (output === source) continue;
 
     if (dryRun) {
-      console.log(`[dry-run] ${filePath}: ${edits.length} edit(s)`);
-      for (const e of edits) console.log(`  ${e.note}`);
+      const displayPath = path.relative(Deno.cwd(), filePath) || filePath;
+      const rendered = renderUnifiedDiff(source, output, displayPath, useColor);
+      if (rendered) console.log(rendered);
     } else {
       await Deno.writeTextFile(filePath, output);
       console.log(`updated ${filePath} (${edits.length} edit(s))`);
