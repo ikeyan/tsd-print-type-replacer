@@ -1,0 +1,16 @@
+{
+  "tasks": {
+    "run": "deno run --allow-read --allow-write=. tsd-print-type-replacer.ts",
+    "test": "deno test --allow-read --allow-write=. --allow-env"
+  },
+  "imports": {
+    "typescript": "npm:typescript@5.6.3"
+  },
+  "fmt": {
+    "useTabs": false,
+    "lineWidth": 100,
+    "indentWidth": 2,
+    "semiColons": true,
+    "singleQuote": false
+  }
+}
