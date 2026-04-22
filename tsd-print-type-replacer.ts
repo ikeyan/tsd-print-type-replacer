@@ -12,6 +12,7 @@
 import ts from "npm:typescript@5.6.3";
 import parseArgs from "npm:minimist@1.2.8";
 import * as path from "node:path";
+import { styleText } from "node:util";
 
 const HELP = `tsd-print-type-replacer - rewrite \`{} as T\` assertions from tsd printType output
 
@@ -438,14 +439,6 @@ function myersCore(a: readonly string[], b: readonly string[]): DiffOp[] {
 // Unified diff rendering (for --dry-run)
 // ---------------------------------------------------------------------------
 
-const ANSI = {
-  reset: "\x1b[0m",
-  red: "\x1b[31m",
-  green: "\x1b[32m",
-  cyan: "\x1b[36m",
-  bold: "\x1b[1m",
-};
-
 type DiffLineKind = " " | "-" | "+";
 
 interface DiffHunk {
@@ -542,30 +535,36 @@ function buildHunks(
   return hunks;
 }
 
+type StyleTextFormat = Parameters<typeof styleText>[0];
+
 function renderUnifiedDiff(
   oldContent: string,
   newContent: string,
   displayPath: string,
   useColor: boolean,
 ): string {
-  const paint = (codes: string, s: string) => useColor ? `${codes}${s}${ANSI.reset}` : s;
+  // Deno 2.7's styleText doesn't actually gate on the target stream, so we
+  // keep our own `useColor` decision (set in main() from Deno.stdout.isTerminal)
+  // and force styleText to apply the escape codes with validateStream:false.
+  const paint = (format: StyleTextFormat, text: string) =>
+    useColor ? styleText(format, text, { validateStream: false }) : text;
 
   const hunks = buildHunks(oldContent, newContent, 3);
   if (hunks.length === 0) return "";
 
   const out: string[] = [];
-  out.push(paint(ANSI.bold, `--- a/${displayPath}`));
-  out.push(paint(ANSI.bold, `+++ b/${displayPath}`));
+  out.push(paint("bold", `--- a/${displayPath}`));
+  out.push(paint("bold", `+++ b/${displayPath}`));
   for (const h of hunks) {
     out.push(
       paint(
-        ANSI.cyan,
+        "cyan",
         `@@ -${h.oldStart},${h.oldCount} +${h.newStart},${h.newCount} @@`,
       ),
     );
     for (const ln of h.lines) {
-      if (ln.kind === "-") out.push(paint(ANSI.red, `-${ln.text}`));
-      else if (ln.kind === "+") out.push(paint(ANSI.green, `+${ln.text}`));
+      if (ln.kind === "-") out.push(paint("red", `-${ln.text}`));
+      else if (ln.kind === "+") out.push(paint("green", `+${ln.text}`));
       else out.push(` ${ln.text}`);
     }
   }
