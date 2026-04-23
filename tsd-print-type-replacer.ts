@@ -1,4 +1,4 @@
-#!/usr/bin/env -S deno run --allow-read --allow-write --allow-env
+#!/usr/bin/env -S deno run --allow-read --allow-write --allow-env --allow-sys=cpus
 /**
  * tsd-print-type-replacer
  *
@@ -6,23 +6,18 @@
  * `{} as T` type assertions in the source files to use the type tsd reported.
  *
  * Usage:
- *   deno run --allow-read --allow-write=. --allow-env tsd-print-type-replacer.ts [options] [target-dir]
+ *   deno run --allow-read --allow-write=. --allow-env --allow-sys=cpus tsd-print-type-replacer.ts [options] [target-dir]
  */
 
 import ts from "npm:typescript@5.6.3";
 import parseArgs from "npm:minimist@1.2.8";
 import * as path from "node:path";
 import { styleText } from "node:util";
-// tsd is CJS; its default export (the runner function) is nested under .default
-// deno-lint-ignore no-explicit-any
-import tsdModule from "npm:tsd@0.33.0";
-const tsdRun: (options: { cwd: string }) => Promise<TsdApiDiagnostic[]> =
-  (tsdModule as any).default ?? tsdModule;
 
 const HELP = `tsd-print-type-replacer - rewrite \`{} as T\` assertions from tsd printType output
 
 USAGE
-  deno run --allow-read --allow-write=. --allow-env tsd-print-type-replacer.ts [options] [target-dir]
+  deno run --allow-read --allow-write=. --allow-env --allow-sys=cpus tsd-print-type-replacer.ts [options] [target-dir]
   tsd 2>&1 | deno run --allow-read --allow-write=. tsd-print-type-replacer.ts --stdin [options] [target-dir]
 
   By default, runs tsd directly via its programmatic API to obtain accurate
@@ -137,12 +132,32 @@ interface TsdApiDiagnostic {
   column?: number;
 }
 
+let tsdRunPromise:
+  | Promise<(options: { cwd: string }) => Promise<TsdApiDiagnostic[]>>
+  | null = null;
+
+async function loadTsdRun(): Promise<
+  (options: { cwd: string }) => Promise<TsdApiDiagnostic[]>
+> {
+  if (!tsdRunPromise) {
+    tsdRunPromise = import("npm:tsd@0.33.0").then((mod) => {
+      // tsd is CJS; its default export (the runner function) is nested under .default
+      // deno-lint-ignore no-explicit-any
+      return ((mod as any).default ?? mod) as (
+        options: { cwd: string },
+      ) => Promise<TsdApiDiagnostic[]>;
+    });
+  }
+  return await tsdRunPromise;
+}
+
 async function runTsdDirect(cwd: string): Promise<TsdDiag[]> {
   const absDir = path.resolve(cwd);
   console.error(`tsd-print-type-replacer: running tsd in ${absDir}…`);
 
   let rawDiagnostics: TsdApiDiagnostic[];
   try {
+    const tsdRun = await loadTsdRun();
     rawDiagnostics = await tsdRun({ cwd: absDir });
   } catch (err) {
     console.error(
@@ -258,6 +273,94 @@ function nextSiblingStatement(stmt: ts.Statement): ts.Statement | null {
   return list[idx + 1];
 }
 
+function isPrintTypeCall(call: ts.CallExpression): boolean {
+  const callee = call.expression;
+  return (
+    (ts.isIdentifier(callee) && callee.text === "printType") ||
+    (ts.isPropertyAccessExpression(callee) && callee.name.text === "printType")
+  );
+}
+
+function liftThroughParentheses(expr: ts.Expression): ts.Expression {
+  let cur = expr;
+  while (cur.parent && ts.isParenthesizedExpression(cur.parent)) {
+    cur = cur.parent;
+  }
+  return cur;
+}
+
+function isCommaBinaryExpression(node: ts.Node): node is ts.BinaryExpression {
+  return ts.isBinaryExpression(node) &&
+    node.operatorToken.kind === ts.SyntaxKind.CommaToken;
+}
+
+function flattenCommaOperands(expr: ts.Expression): ts.Expression[] {
+  if (!isCommaBinaryExpression(expr)) return [expr];
+  return [
+    ...flattenCommaOperands(expr.left),
+    ...flattenCommaOperands(expr.right),
+  ];
+}
+
+function findCommaContext(
+  expr: ts.Expression,
+): {
+  root: ts.BinaryExpression;
+  operands: ts.Expression[];
+  index: number;
+} | null {
+  let current: ts.Expression = expr;
+  let root: ts.BinaryExpression | null = null;
+
+  while (
+    current.parent &&
+    isCommaBinaryExpression(current.parent) &&
+    (current.parent.left === current || current.parent.right === current)
+  ) {
+    root = current.parent;
+    current = current.parent;
+  }
+
+  if (!root) return null;
+
+  const operands = flattenCommaOperands(root);
+  const index = operands.indexOf(expr);
+  if (index < 0) return null;
+
+  return { root, operands, index };
+}
+
+function lineStartPos(source: string, pos: number): number {
+  let i = pos;
+  while (i > 0 && source[i - 1] !== "\n" && source[i - 1] !== "\r") i--;
+  return i;
+}
+
+function expandStatementDeletionRange(
+  source: string,
+  stmt: ts.Statement,
+  sf: ts.SourceFile,
+): { start: number; end: number } {
+  let start = stmt.getStart(sf);
+  const lineStart = lineStartPos(source, start);
+  if (/^[\t ]*$/.test(source.slice(lineStart, start))) {
+    start = lineStart;
+  }
+
+  let end = stmt.getEnd();
+  let i = end;
+  while (i < source.length && (source[i] === " " || source[i] === "\t")) i++;
+  if (i >= source.length) {
+    end = source.length;
+  } else if (source[i] === "\r" && source[i + 1] === "\n") {
+    end = i + 2;
+  } else if (source[i] === "\n" || source[i] === "\r") {
+    end = i + 1;
+  }
+
+  return { start, end };
+}
+
 function collectAsExpressions(root: ts.Node): ts.AsExpression[] {
   const out: ts.AsExpression[] = [];
   const visit = (n: ts.Node) => {
@@ -277,6 +380,76 @@ interface Edit {
   end: number;
   newText: string;
   note: string;
+}
+
+function findSourceAsExpression(
+  call: ts.CallExpression,
+  exprTokens: Tok[],
+  sf: ts.SourceFile,
+): ts.AsExpression | null {
+  for (const cand of collectAsExpressions(call)) {
+    if (tokensEqual(tokenize(cand.getText(sf)), exprTokens)) {
+      return cand;
+    }
+  }
+  return null;
+}
+
+function buildDeleteSourceCallEdit(
+  source: string,
+  fileName: string,
+  call: ts.CallExpression,
+  sf: ts.SourceFile,
+): Edit {
+  const liftedCall = liftThroughParentheses(call);
+
+  if (
+    liftedCall.parent &&
+    ts.isExpressionStatement(liftedCall.parent) &&
+    liftedCall.parent.expression === liftedCall
+  ) {
+    const range = expandStatementDeletionRange(source, liftedCall.parent, sf);
+    return {
+      start: range.start,
+      end: range.end,
+      newText: "",
+      note: `${fileName}: delete source printType statement at ${range.start}..${range.end}`,
+    };
+  }
+
+  const comma = findCommaContext(liftedCall);
+  if (comma) {
+    if (comma.index < comma.operands.length - 1) {
+      const nextOperand = comma.operands[comma.index + 1];
+      return {
+        start: liftedCall.getStart(sf),
+        end: nextOperand.getStart(sf),
+        newText: "",
+        note: `${fileName}: remove source printType comma operand at ${liftedCall.getStart(sf)}..${
+          nextOperand.getStart(sf)
+        }`,
+      };
+    }
+
+    const leftText = comma.root.left.getText(sf);
+    return {
+      start: comma.root.getStart(sf),
+      end: comma.root.getEnd(),
+      newText: `void (${leftText})`,
+      note: `${fileName}: replace trailing source printType comma operand at ${
+        comma.root.getStart(sf)
+      }..${comma.root.getEnd()} with \`void (${leftText})\``,
+    };
+  }
+
+  return {
+    start: liftedCall.getStart(sf),
+    end: liftedCall.getEnd(),
+    newText: "void 0",
+    note: `${fileName}: replace source printType call at ${
+      liftedCall.getStart(sf)
+    }..${liftedCall.getEnd()} with \`void 0\``,
+  };
 }
 
 function processFile(
@@ -316,15 +489,24 @@ function processFile(
       continue;
     }
 
+    const call = findCallAtPosition(sf, diag.line, diag.column);
+    if (!call || !isPrintTypeCall(call)) {
+      warnings.push(
+        `${fileName}:${diag.line}:${diag.column}: could not locate source printType call; skipped`,
+      );
+      continue;
+    }
+
+    const sourceAsExpr = findSourceAsExpression(call, exprTokens, sf);
+    if (!sourceAsExpr) {
+      warnings.push(
+        `${fileName}:${diag.line}:${diag.column}: source printType call does not contain matching \`as\` expression; skipped`,
+      );
+      continue;
+    }
+
     let scope: ts.Node | null = sf;
     if (nextStatementOnly) {
-      const call = findCallAtPosition(sf, diag.line, diag.column);
-      if (!call) {
-        warnings.push(
-          `${fileName}:${diag.line}:${diag.column}: could not locate printType call; skipped`,
-        );
-        continue;
-      }
       const stmt = containingStatement(call);
       if (!stmt) {
         warnings.push(
@@ -345,6 +527,8 @@ function processFile(
     const candidates = collectAsExpressions(scope);
     let matched = 0;
     for (const cand of candidates) {
+      if (cand === sourceAsExpr) continue;
+
       const candText = cand.getText(sf);
       const candTokens = tokenize(candText);
       if (!tokensEqual(candTokens, exprTokens)) continue;
@@ -363,9 +547,12 @@ function processFile(
 
     if (matched === 0) {
       warnings.push(
-        `${fileName}:${diag.line}:${diag.column}: no matching \`as\` expression found for: ${diag.expression}`,
+        `${fileName}:${diag.line}:${diag.column}: no matching \`as\` expression found outside source printType call for: ${diag.expression}`,
       );
+      continue;
     }
+
+    edits.push(buildDeleteSourceCallEdit(source, fileName, call, sf));
   }
 
   // Dedupe identical edits (same start/end/newText)

@@ -1,7 +1,7 @@
 {
   "tasks": {
-    "run": "deno run --allow-read --allow-write=. tsd-print-type-replacer.ts",
-    "test": "deno test --allow-read --allow-write=. --allow-env"
+    "run": "deno run --allow-read --allow-write=. --allow-env --allow-sys=cpus tsd-print-type-replacer.ts",
+    "test": "deno test --allow-read --allow-write --allow-env --allow-run"
   },
   "imports": {
     "typescript": "npm:typescript@5.6.3"
