@@ -143,7 +143,7 @@ async function loadTsdRun(): Promise<
     tsdRunPromise = import("npm:tsd@0.33.0").then((mod) => {
       // tsd is CJS; its default export (the runner function) is nested under .default
       // deno-lint-ignore no-explicit-any
-      return ((mod as any).default ?? mod) as (
+      return ((mod as any).default.default) as (
         options: { cwd: string },
       ) => Promise<TsdApiDiagnostic[]>;
     });
