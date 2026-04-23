@@ -1,29 +1,42 @@
-#!/usr/bin/env -S deno run --allow-read --allow-write
+#!/usr/bin/env -S deno run --allow-read --allow-write --allow-env
 /**
  * tsd-print-type-replacer
  *
- * Reads tsd's `printType` warnings from stdin, then rewrites the matching
+ * Runs tsd to collect `printType` warnings, then rewrites the matching
  * `{} as T` type assertions in the source files to use the type tsd reported.
  *
  * Usage:
- *   tsd | deno run --allow-read --allow-write=. tsd-print-type-replacer.ts [options] [target-dir]
+ *   deno run --allow-read --allow-write=. --allow-env tsd-print-type-replacer.ts [options] [target-dir]
  */
 
 import ts from "npm:typescript@5.6.3";
 import parseArgs from "npm:minimist@1.2.8";
 import * as path from "node:path";
 import { styleText } from "node:util";
+// tsd is CJS; its default export (the runner function) is nested under .default
+// deno-lint-ignore no-explicit-any
+import tsdModule from "npm:tsd@0.33.0";
+const tsdRun: (options: { cwd: string }) => Promise<TsdApiDiagnostic[]> =
+  (tsdModule as any).default ?? tsdModule;
 
 const HELP = `tsd-print-type-replacer - rewrite \`{} as T\` assertions from tsd printType output
 
 USAGE
-  tsd 2>&1 | deno run --allow-read --allow-write=. tsd-print-type-replacer.ts [options] [target-dir]
+  deno run --allow-read --allow-write=. --allow-env tsd-print-type-replacer.ts [options] [target-dir]
+  tsd 2>&1 | deno run --allow-read --allow-write=. tsd-print-type-replacer.ts --stdin [options] [target-dir]
 
-  Note: tsd writes its formatted diagnostics to stderr, so remember to redirect
-  stderr into the pipe with \`2>&1\`.
+  By default, runs tsd directly via its programmatic API to obtain accurate
+  diagnostic messages (avoids eslint-formatter-pretty mangling backticks in
+  template literal types).
+
+  With --stdin, reads tsd's formatted text output from stdin instead (legacy
+  mode — subject to formatter quirks with backticks and multiline expressions).
 
 ARGUMENTS
-  target-dir  Base directory for resolving tsd file paths (default: ".")
+  target-dir  Project root directory (default: ".")
+              In default mode, this is the cwd passed to tsd (must contain
+              package.json). In --stdin mode, it resolves relative file paths
+              from tsd output.
 
 OPTIONS
   -n, --next-statement-only   Only rewrite the statement immediately after each
@@ -31,13 +44,9 @@ OPTIONS
                               expression in the file is rewritten.
       --dry-run               Show a unified diff of planned edits without
                               writing files. Colors the output on a TTY.
+      --stdin                 Read tsd's formatted output from stdin instead of
+                              running tsd directly.
   -h, --help                  Show this help.
-
-INPUT
-  The output of \`tsd\` on stdin. Each printType diagnostic has the form
-    ⚠  LINE:COL  Type for expression EXPR is: TYPE
-  When EXPR is a type assertion (\`X as T\`), the tool rewrites the \`T\` part
-  to the reported TYPE. Matching ignores whitespace and comments (token-based).
 `;
 
 // ---------------------------------------------------------------------------
@@ -91,6 +100,76 @@ function parseTsdOutput(raw: string): TsdDiag[] {
     }
   }
 
+  return results;
+}
+
+// ---------------------------------------------------------------------------
+// tsd programmatic API
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse a raw tsd diagnostic message of the form:
+ *   Type for expression `EXPR` is: `TYPE`
+ * Returns the expression and type strings, or null if the message doesn't match.
+ */
+function parsePrintTypeDiagnostic(
+  message: string,
+): { expression: string; type: string } | null {
+  const prefix = "Type for expression `";
+  if (!message.startsWith(prefix) || !message.endsWith("`")) return null;
+
+  const inner = message.slice(prefix.length, -1);
+  const sep = "` is: `";
+  const sepIdx = inner.indexOf(sep);
+  if (sepIdx < 0) return null;
+
+  return {
+    expression: inner.slice(0, sepIdx),
+    type: inner.slice(sepIdx + sep.length),
+  };
+}
+
+interface TsdApiDiagnostic {
+  fileName: string;
+  message: string;
+  severity: string;
+  line?: number;
+  column?: number;
+}
+
+async function runTsdDirect(cwd: string): Promise<TsdDiag[]> {
+  const absDir = path.resolve(cwd);
+  console.error(`tsd-print-type-replacer: running tsd in ${absDir}…`);
+
+  let rawDiagnostics: TsdApiDiagnostic[];
+  try {
+    rawDiagnostics = await tsdRun({ cwd: absDir });
+  } catch (err) {
+    console.error(
+      `tsd-print-type-replacer: tsd failed: ${(err as Error).message}`,
+    );
+    Deno.exit(1);
+  }
+
+  const results: TsdDiag[] = [];
+  for (const diag of rawDiagnostics) {
+    if (diag.severity !== "warning") continue;
+
+    const parsed = parsePrintTypeDiagnostic(diag.message);
+    if (!parsed) continue;
+
+    results.push({
+      filePath: diag.fileName,
+      line: diag.line ?? 0,
+      column: diag.column ?? 0,
+      expression: parsed.expression,
+      type: parsed.type,
+    });
+  }
+
+  console.error(
+    `tsd-print-type-replacer: found ${results.length} printType diagnostic(s) from tsd`,
+  );
   return results;
 }
 
@@ -591,7 +670,7 @@ async function readStdin(): Promise<string> {
 
 async function main() {
   const args = parseArgs(Deno.args, {
-    boolean: ["next-statement-only", "dry-run", "help"],
+    boolean: ["next-statement-only", "dry-run", "help", "stdin"],
     alias: { n: "next-statement-only", h: "help" },
   });
 
@@ -604,15 +683,23 @@ async function main() {
   const baseDir = positional.length > 0 ? String(positional[0]) : ".";
   const nextOnly = Boolean(args["next-statement-only"]);
   const dryRun = Boolean(args["dry-run"]);
+  const useStdin = Boolean(args.stdin);
 
   const useColor = dryRun && Deno.stdout.isTerminal();
 
-  const raw = await readStdin();
-  const diagnostics = parseTsdOutput(raw);
+  let diagnostics: TsdDiag[];
+  if (useStdin) {
+    const raw = await readStdin();
+    diagnostics = parseTsdOutput(raw);
+  } else {
+    diagnostics = await runTsdDirect(baseDir);
+  }
 
   if (diagnostics.length === 0) {
     console.error(
-      "tsd-print-type-replacer: no `Type for expression ... is: ...` diagnostics found on stdin.",
+      useStdin
+        ? "tsd-print-type-replacer: no `Type for expression ... is: ...` diagnostics found on stdin."
+        : "tsd-print-type-replacer: no printType diagnostics found (tsd returned 0 matching warnings).",
     );
     return;
   }
